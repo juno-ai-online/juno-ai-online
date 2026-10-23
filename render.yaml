@@ -1,0 +1,43 @@
+services:
+  - type: web
+    name: juno-ai-api
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 200
+    healthCheckPath: /api/health
+    disk:
+      name: juno-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: JUNO_DATA_DIR
+        value: /var/data
+      - key: DATABASE
+        value: /var/data/juno.db
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: SESSION_COOKIE_SAMESITE
+        value: None
+      - key: JUNO_SESSION_SECRET
+        generateValue: true
+      - key: JUNO_PRIVATE_MEMORY_KEY
+        sync: false
+      - key: JUNO_ALLOWED_ORIGINS
+        sync: false
+      - key: JUNO_CLOUD_AI_BASE_URL
+        sync: false
+      - key: JUNO_CLOUD_AI_API_KEY
+        sync: false
+      - key: JUNO_CLOUD_AI_MODEL
+        sync: false
+      - key: JUNO_ADMIN_EMAIL
+        sync: false
+      - key: JUNO_ADMIN_PASSWORD
+        sync: false
+      - key: OLLAMA_TIMEOUT
+        value: "180"
+      - key: DDGS_REGION
+        value: ng-en
