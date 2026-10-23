@@ -34,6 +34,10 @@ SESSION_COOKIE_SAMESITE = os.getenv('SESSION_COOKIE_SAMESITE', 'Lax').strip().ca
 if SESSION_COOKIE_SAMESITE not in ('Lax', 'Strict', 'None'):
     SESSION_COOKIE_SAMESITE = 'Lax'
 
+# Configure logging before any startup helper uses log.warning/log.exception.
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+log = logging.getLogger('juno-v30')
+
 def persistent_session_secret():
     configured=os.getenv('JUNO_SESSION_SECRET','').strip()
     if configured and not configured.startswith('replace-with-'):
@@ -59,8 +63,6 @@ app = Flask(__name__, template_folder='templates', static_folder='static')
 app.config.update(SECRET_KEY=persistent_session_secret(), SESSION_COOKIE_HTTPONLY=True,
                   SESSION_COOKIE_SAMESITE=SESSION_COOKIE_SAMESITE, SESSION_COOKIE_SECURE=COOKIE_SECURE,
                   PERMANENT_SESSION_LIFETIME=timedelta(days=SESSION_DAYS), MAX_CONTENT_LENGTH=100 * 1024 * 1024)  # No arbitrary Flask request-size ceiling; deploy behind normal infrastructure safeguards.
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-log = logging.getLogger('juno-v30')
 
 def request_origin():
     scheme = (request.headers.get('X-Forwarded-Proto') or request.scheme).split(',')[0].strip()
