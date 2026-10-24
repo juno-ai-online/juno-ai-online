@@ -34,10 +34,6 @@ SESSION_COOKIE_SAMESITE = os.getenv('SESSION_COOKIE_SAMESITE', 'Lax').strip().ca
 if SESSION_COOKIE_SAMESITE not in ('Lax', 'Strict', 'None'):
     SESSION_COOKIE_SAMESITE = 'Lax'
 
-# Configure logging before any startup helper uses log.warning/log.exception.
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-log = logging.getLogger('juno-v30')
-
 def persistent_session_secret():
     configured=os.getenv('JUNO_SESSION_SECRET','').strip()
     if configured and not configured.startswith('replace-with-'):
@@ -63,6 +59,8 @@ app = Flask(__name__, template_folder='templates', static_folder='static')
 app.config.update(SECRET_KEY=persistent_session_secret(), SESSION_COOKIE_HTTPONLY=True,
                   SESSION_COOKIE_SAMESITE=SESSION_COOKIE_SAMESITE, SESSION_COOKIE_SECURE=COOKIE_SECURE,
                   PERMANENT_SESSION_LIFETIME=timedelta(days=SESSION_DAYS), MAX_CONTENT_LENGTH=100 * 1024 * 1024)  # No arbitrary Flask request-size ceiling; deploy behind normal infrastructure safeguards.
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+log = logging.getLogger('juno-v30')
 
 def request_origin():
     scheme = (request.headers.get('X-Forwarded-Proto') or request.scheme).split(',')[0].strip()
@@ -91,44 +89,67 @@ def add_cors_headers(response):
     return response
 
 
+def cloud_key_cipher():
+    """Encrypt registered cloud API keys using a key derived from JUNO's persistent server secret."""
+    raw = str(app.config.get('SECRET_KEY', ''))
+    key = base64.urlsafe_b64encode(hashlib.sha256(('JUNO_CLOUD_KEYS_V1:' + raw).encode('utf-8')).digest())
+    return Fernet(key)
+
+
+def cloud_provider_rows():
+    with db() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT id,name,base_url,model,encrypted_api_key,enabled,priority,status,last_tested,created_at,updated_at FROM cloud_provider_keys ORDER BY priority,id"
+        ).fetchall()]
+
+
 def cloud_chat_completion(messages, requested_model='auto'):
-    """Call a configured OpenAI-compatible hosted model; return (answer, model_name)."""
-    if not (JUNO_CLOUD_AI_BASE_URL and JUNO_CLOUD_AI_API_KEY and JUNO_CLOUD_AI_MODEL):
-        return None
-    # Current hosted adapter is text-only. Image requests can continue to vision-capable Ollama workers.
+    """Try enabled registered OpenAI-compatible cloud providers, then legacy environment configuration."""
     if any(isinstance(m, dict) and m.get('images') for m in messages):
-        return None
-    if requested_model not in ('', 'auto', 'cloud', 'online', JUNO_CLOUD_AI_MODEL):
-        return None
-    url = JUNO_CLOUD_AI_BASE_URL
-    if not url.endswith('/chat/completions'):
-        url += '/chat/completions'
+        return None  # Current cloud adapter is text-only; image requests can use a vision-capable Ollama worker.
     clean_messages = []
     for item in messages:
         role = item.get('role')
-        if role not in ('system', 'user', 'assistant'):
-            continue
-        content = item.get('content', '')
-        if isinstance(content, str):
-            clean_messages.append({'role': role, 'content': content})
-    headers = {'Authorization': f'Bearer {JUNO_CLOUD_AI_API_KEY}', 'Content-Type': 'application/json'}
+        if role in ('system', 'user', 'assistant') and isinstance(item.get('content', ''), str):
+            clean_messages.append({'role': role, 'content': item.get('content', '')})
+    candidates = []
     try:
-        response = requests.post(url, headers=headers, json={
-            'model': JUNO_CLOUD_AI_MODEL,
-            'messages': clean_messages,
-            'temperature': 0.4,
-        }, timeout=OLLAMA_TIMEOUT)
-        response.raise_for_status()
-        payload = response.json()
-        choices = payload.get('choices') or []
-        answer = str(((choices[0].get('message') or {}).get('content') or '') if choices else '').strip()
-        if not answer:
-            raise RuntimeError('Hosted AI returned an empty response.')
-        return answer, JUNO_CLOUD_AI_MODEL
-    except Exception as exc:
-        # Do not log the API key or request payload.
-        log.warning('Hosted AI request failed (%s).', type(exc).__name__)
-        return None
+        for row in cloud_provider_rows():
+            if not row['enabled'] or requested_model not in ('', 'auto', 'cloud', 'online', row['name'], row['model']):
+                continue
+            try:
+                key = cloud_key_cipher().decrypt(bytes(row['encrypted_api_key'])).decode('utf-8')
+                candidates.append((row['id'], row['name'], row['base_url'], row['model'], key))
+            except (InvalidToken, ValueError, UnicodeDecodeError):
+                log.error('Registered cloud provider %s key could not be decrypted.', row['id'])
+    except sqlite3.Error:
+        log.exception('Could not load registered cloud providers.')
+    if JUNO_CLOUD_AI_BASE_URL and JUNO_CLOUD_AI_API_KEY and JUNO_CLOUD_AI_MODEL and requested_model in ('', 'auto', 'cloud', 'online', JUNO_CLOUD_AI_MODEL):
+        candidates.append((None, 'Environment Cloud AI', JUNO_CLOUD_AI_BASE_URL, JUNO_CLOUD_AI_MODEL, JUNO_CLOUD_AI_API_KEY))
+    for provider_id, name, base_url, model_name, api_key in candidates:
+        url = base_url.rstrip('/')
+        if not url.endswith('/chat/completions'):
+            url += '/chat/completions'
+        try:
+            response = requests.post(url, headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+                json={'model': model_name, 'messages': clean_messages, 'temperature': 0.4}, timeout=min(OLLAMA_TIMEOUT, 90))
+            response.raise_for_status()
+            choices = response.json().get('choices') or []
+            answer = str(((choices[0].get('message') or {}).get('content') or '') if choices else '').strip()
+            if not answer:
+                raise RuntimeError('Empty cloud response')
+            if provider_id is not None:
+                with db() as c:
+                    c.execute("UPDATE cloud_provider_keys SET status='online',last_tested=?,updated_at=? WHERE id=?", (now(), now(), provider_id)); c.commit()
+            return answer, model_name
+        except Exception as exc:
+            # Never log provider response bodies, URLs containing credentials, or keys.
+            log.warning('Cloud provider %s request failed (%s); trying next provider.', name, type(exc).__name__)
+            if provider_id is not None:
+                with db() as c:
+                    c.execute("UPDATE cloud_provider_keys SET status='error',last_tested=?,updated_at=? WHERE id=?", (now(), now(), provider_id)); c.commit()
+    return None
+
 DB_LOCK = threading.RLock()
 WORKER_LOCK = threading.RLock()
 WORKER_BUSY = set()
@@ -167,6 +188,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,title TEXT NOT NULL DEFAULT 'New chat',summary TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,conversation_id TEXT NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL,model TEXT,computer_id INTEGER,response_time REAL,created_at TEXT NOT NULL,FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,FOREIGN KEY(computer_id) REFERENCES computers(id) ON DELETE SET NULL);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS cloud_provider_keys(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL UNIQUE,base_url TEXT NOT NULL,model TEXT NOT NULL,encrypted_api_key BLOB NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,priority INTEGER NOT NULL DEFAULT 10,status TEXT NOT NULL DEFAULT 'untested',last_tested TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,body TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,trigger_type TEXT NOT NULL DEFAULT 'next_login',trigger_value INTEGER NOT NULL DEFAULT 0,start_at TEXT,end_at TEXT,created_at TEXT NOT NULL,created_by INTEGER);
         CREATE TABLE IF NOT EXISTS notification_seen(user_id INTEGER NOT NULL,notification_id INTEGER NOT NULL,seen_at TEXT NOT NULL,PRIMARY KEY(user_id,notification_id),FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,FOREIGN KEY(notification_id) REFERENCES notifications(id) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS invitation_codes(id INTEGER PRIMARY KEY AUTOINCREMENT,code_hash TEXT NOT NULL UNIQUE,assigned_name TEXT NOT NULL,used_by INTEGER,used_at TEXT,expires_at TEXT,created_at TEXT NOT NULL,created_by INTEGER);
@@ -1096,11 +1118,11 @@ def chat():
                     with WORKER_LOCK: WORKER_BUSY.discard(rw['id'])
     elapsed=time.time()-started
     if not answer:
-        answer=('JUNO cannot inspect this image yet because no available AI computer has a recognized vision-capable Ollama model installed. Ask the administrator to install a vision model such as Gemma 3/4, Qwen VL, or LLaVA.' if attached else 'JUNO could not reach a configured online AI service or available Ollama computer. Check the cloud AI settings in the server environment, or ensure an Ollama worker is reachable.')
+        answer=('JUNO cannot inspect this image yet because no available AI computer has a recognized vision-capable Ollama model installed. Ask the administrator to install a vision model such as Gemma 3/4, Qwen VL, or LLaVA.' if attached else 'JUNO is temporarily unavailable. Please try again shortly.')
         with db() as c:
             c.execute('INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)',(cid,'assistant',answer,now()))
             c.execute('INSERT INTO request_stats(user_id,conversation_id,success,response_time,created_at) VALUES(?,?,?,?,?)',(uid,cid,0,elapsed,now())); c.commit()
-        return jsonify({'answer':answer,'error':str(err) if err else 'No available workers.','sources':[],'images':image_results,'map':map_data,'search_error':None,'search_used':search_used,'knowledge_suggestion_submitted':bool(knowledge_suggestion)}),503
+        return jsonify({'answer':answer,'error':'JUNO is temporarily unavailable. Please try again shortly.','sources':[],'images':image_results,'map':map_data,'search_error':None,'search_used':search_used,'knowledge_suggestion_submitted':bool(knowledge_suggestion)}),503
     with db() as c:
         c.execute('INSERT INTO messages(conversation_id,role,content,model,computer_id,response_time,created_at) VALUES(?,?,?,?,?,?,?)',(cid,'assistant',answer,chosen_model,worker['id'],elapsed,now()))
         for upload_id,_,_ in attached:
@@ -1182,7 +1204,17 @@ def admin_overview():
         invites=[dict(r) for r in c.execute('SELECT id,assigned_name,used_by,used_at,expires_at,created_at FROM invitation_codes ORDER BY id DESC LIMIT 100')]
         premium=[dict(r) for r in c.execute('SELECT id,label,enabled,expires_at,created_at FROM premium_codes ORDER BY id DESC LIMIT 100')]
         suggestions=[dict(r) for r in c.execute('SELECT s.*,u.name AS user_name,u.email AS user_email FROM user_suggestions s JOIN users u ON u.id=s.user_id ORDER BY s.id DESC LIMIT 300')]
-    return jsonify({'stats':{'users':total,'online':online,'requests':requests_total,'chats':chats,'avg_response_time':round(avg,2)},'users':users,'computers':workers,'settings':settings,'notifications':notes,'knowledge':knowledge,'invitations':invites,'premium_codes':premium,'suggestions':suggestions})
+        cloud_keys=[{'id':r['id'],'name':r['name'],'base_url':r['base_url'],'model':r['model'],'enabled':bool(r['enabled']),'priority':r['priority'],'status':r['status'],'last_tested':r['last_tested'],'created_at':r['created_at']} for r in c.execute('SELECT id,name,base_url,model,enabled,priority,status,last_tested,created_at FROM cloud_provider_keys ORDER BY priority,id')]
+    storage = {
+        'knowledge_count': len(knowledge),
+        'database_exists': os.path.isfile(DB_PATH),
+        'database_bytes': os.path.getsize(DB_PATH) if os.path.isfile(DB_PATH) else 0,
+        'database_path': DB_PATH,
+        'data_dir': DATA_DIR,
+        'persistent_disk_detected': bool(os.getenv('RENDER')) and os.path.isdir('/var/data') and os.path.ismount('/var/data'),
+        'render_environment': bool(os.getenv('RENDER')),
+    }
+    return jsonify({'stats':{'users':total,'online':online,'requests':requests_total,'chats':chats,'avg_response_time':round(avg,2)},'users':users,'computers':workers,'settings':settings,'notifications':notes,'knowledge':knowledge,'invitations':invites,'premium_codes':premium,'suggestions':suggestions,'cloud_keys':cloud_keys,'storage':storage})
 
 @app.post('/api/admin/suggestions/<int:sid>')
 @admin_required
@@ -1210,6 +1242,90 @@ def admin_user_update(uid):
         else: return jsonify({'error':'Unknown action.'}),400
         c.commit()
     return jsonify({'ok':True})
+
+def validate_cloud_provider_input(d):
+    name = str(d.get('name', '')).strip()[:80]
+    base_url = str(d.get('base_url', '')).strip().rstrip('/')
+    model_name = str(d.get('model', '')).strip()[:180]
+    api_key = str(d.get('api_key', '')).strip()
+    try: priority = max(1, min(10000, int(d.get('priority', 50) or 50)))
+    except (ValueError, TypeError): raise ValueError('Priority must be a whole number.')
+    parsed = urlparse(base_url)
+    if not name or not model_name or not base_url: raise ValueError('Provider name, API base URL, and model name are required.')
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError('Use a valid HTTPS API base URL without embedded credentials or query parameters.')
+    if not api_key: raise ValueError('Enter the API key.')
+    if len(api_key) > 4096: raise ValueError('The API key is too long.')
+    return name, base_url, model_name, api_key, priority
+
+
+@app.post('/api/admin/cloud-keys')
+@admin_required
+def admin_cloud_key_save():
+    d = request.get_json(silent=True) or {}
+    try: name, base_url, model_name, api_key, priority = validate_cloud_provider_input(d)
+    except (ValueError, TypeError) as exc: return jsonify({'error': str(exc) or 'Check the provider details.'}), 400
+    encrypted = cloud_key_cipher().encrypt(api_key.encode('utf-8')); stamp = now()
+    try:
+        with db() as c:
+            if d.get('id'):
+                try: provider_id = int(d['id'])
+                except (ValueError, TypeError): return jsonify({'error':'Invalid provider ID.'}),400
+                if not c.execute('SELECT id FROM cloud_provider_keys WHERE id=?',(provider_id,)).fetchone(): return jsonify({'error':'Cloud provider not found.'}),404
+                c.execute('UPDATE cloud_provider_keys SET name=?,base_url=?,model=?,encrypted_api_key=?,enabled=?,priority=?,status=?,updated_at=? WHERE id=?',
+                    (name,base_url,model_name,encrypted,int(bool(d.get('enabled',True))),priority,'untested',stamp,provider_id))
+            else:
+                c.execute('INSERT INTO cloud_provider_keys(name,base_url,model,encrypted_api_key,enabled,priority,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                    (name,base_url,model_name,encrypted,int(bool(d.get('enabled',True))),priority,'untested',stamp,stamp))
+            c.commit()
+    except sqlite3.IntegrityError: return jsonify({'error':'A cloud provider with that name already exists.'}),409
+    log.info('Cloud provider configuration saved; API key not logged.')
+    return jsonify({'ok':True})
+
+
+@app.post('/api/admin/cloud-keys/<int:key_id>/test')
+@admin_required
+def admin_cloud_key_test(key_id):
+    with db() as c: row=c.execute('SELECT * FROM cloud_provider_keys WHERE id=?',(key_id,)).fetchone()
+    if not row: return jsonify({'error':'Cloud provider not found.'}),404
+    try:
+        api_key=cloud_key_cipher().decrypt(bytes(row['encrypted_api_key'])).decode('utf-8')
+        base=row['base_url'].rstrip('/'); models_url=base if base.endswith('/models') else base+'/models'
+        started=time.time()
+        try:
+            resp=requests.get(models_url,headers={'Authorization':f'Bearer {api_key}'},timeout=12); resp.raise_for_status()
+        except Exception:
+            # Some compatible providers expose chat completions but not a models-list endpoint.
+            chat_url=base if base.endswith('/chat/completions') else base+'/chat/completions'
+            resp=requests.post(chat_url,headers={'Authorization':f'Bearer {api_key}','Content-Type':'application/json'},
+                json={'model':row['model'],'messages':[{'role':'user','content':'Reply with OK.'}],'max_tokens':5},timeout=15)
+            resp.raise_for_status()
+        status='online'; elapsed=round(time.time()-started,3); detail='API key accepted; provider endpoint responded.'
+    except Exception as exc:
+        status='error'; elapsed=None; detail='Connection test failed. Check the endpoint, key, and model in the provider dashboard.'
+        log.warning('Cloud provider connection test failed (%s).',type(exc).__name__)
+    with db() as c: c.execute('UPDATE cloud_provider_keys SET status=?,last_tested=?,updated_at=? WHERE id=?',(status,now(),now(),key_id)); c.commit()
+    return jsonify({'ok':status=='online','status':status,'response_time':elapsed,'message':detail})
+
+
+@app.post('/api/admin/cloud-keys/<int:key_id>/toggle')
+@admin_required
+def admin_cloud_key_toggle(key_id):
+    d=request.get_json(silent=True) or {}
+    with db() as c:
+        if not c.execute('SELECT id FROM cloud_provider_keys WHERE id=?',(key_id,)).fetchone(): return jsonify({'error':'Cloud provider not found.'}),404
+        c.execute('UPDATE cloud_provider_keys SET enabled=?,updated_at=? WHERE id=?',(int(bool(d.get('enabled'))),now(),key_id)); c.commit()
+    return jsonify({'ok':True})
+
+
+@app.delete('/api/admin/cloud-keys/<int:key_id>')
+@admin_required
+def admin_cloud_key_delete(key_id):
+    with db() as c:
+        cur=c.execute('DELETE FROM cloud_provider_keys WHERE id=?',(key_id,)); c.commit()
+        if not cur.rowcount: return jsonify({'error':'Cloud provider not found.'}),404
+    return jsonify({'ok':True})
+
 
 @app.post('/api/admin/computers')
 @admin_required
@@ -1285,6 +1401,22 @@ def admin_premium_toggle(code_id):
     with db() as c: c.execute('UPDATE premium_grants SET active=0 WHERE code_id=? AND ?=0',(code_id,int(bool(d.get('enabled'))))); c.commit()
     return jsonify({'ok':True})
 
+@app.get('/api/admin/knowledge/export')
+@admin_required
+def admin_knowledge_export():
+    """Download every knowledge entry as a portable JSON backup."""
+    with db() as c:
+        rows = [dict(r) for r in c.execute(
+            'SELECT name,info,tags,enabled,image_url,image_alt,link_url,link_text,created_at,updated_at FROM knowledge ORDER BY id'
+        ).fetchall()]
+    payload = {'format': 'juno-knowledge-v1', 'exported_at': now(), 'count': len(rows), 'items': rows}
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    response = app.response_class(body, mimetype='application/json; charset=utf-8')
+    response.headers['Content-Disposition'] = 'attachment; filename=juno-knowledge-backup.json'
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
 @app.post('/api/admin/knowledge')
 @admin_required
 def admin_knowledge_save():
@@ -1324,7 +1456,11 @@ def admin_worker_test(wid):
     models,elapsed=probe_worker(dict(w)); return jsonify({'ok':bool(models),'models':models,'response_time':elapsed,'status':'online' if models else 'offline'})
 
 @app.get('/api/health')
-def health(): return jsonify({'ok':True,'service':'JUNO AI V31.5','search':'DDGS metasearch (auto backend, no API key)' if DDGS else 'disabled - install ddgs','search_region':DDGS_REGION,'google_sign_in_configured':bool(GOOGLE_CLIENT_ID),'cloud_ai_configured':bool(JUNO_CLOUD_AI_BASE_URL and JUNO_CLOUD_AI_API_KEY and JUNO_CLOUD_AI_MODEL),'time':now()})
+def health():
+    try:
+        with db() as c: registered = c.execute('SELECT 1 FROM cloud_provider_keys WHERE enabled=1 LIMIT 1').fetchone() is not None
+    except sqlite3.Error: registered = False
+    return jsonify({'ok':True,'service':'JUNO AI V32 Cloud Keys','search':'DDGS metasearch (auto backend, no API key)' if DDGS else 'disabled - install ddgs','search_region':DDGS_REGION,'google_sign_in_configured':bool(GOOGLE_CLIENT_ID),'cloud_ai_configured':registered or bool(JUNO_CLOUD_AI_BASE_URL and JUNO_CLOUD_AI_API_KEY and JUNO_CLOUD_AI_MODEL),'time':now()})
 
 @app.errorhandler(413)
 def too_large(_): return jsonify({'error':'Request is too large.'}),413

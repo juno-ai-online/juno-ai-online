@@ -4,3 +4,5 @@
 .state-pill.untested{color:#e5ce8b;background:#292313}.state-pill.error{color:#ff9b9b;background:#2c1719}.state-pill.online{color:#8be0b0;background:#15251e}
 
 .admin-toast.toast-error{border-left-color:#e26e6e;color:#ffd1d1}
+
+.storage-status{margin:12px 0 18px;padding:12px 14px;border:1px solid var(--line,#303030);border-radius:10px;color:var(--muted,#a9a9a9);font-size:13px;line-height:1.5;overflow-wrap:anywhere}.storage-status.storage-warning{border-color:#b7791f;color:#f6c56b;background:rgba(183,121,31,.08)}

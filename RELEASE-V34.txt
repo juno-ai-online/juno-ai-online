@@ -1,0 +1,3 @@
+JUNO AI V34 - EASY UPDATES + KNOWLEDGE BACKUP
+
+Added admin knowledge JSON export, database/storage diagnostics in the admin Knowledge Base panel, a Render persistent-disk warning, and QUICK-UPDATE.md for whole-folder updates with GitHub Desktop.
