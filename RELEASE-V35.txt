@@ -1,0 +1,5 @@
+JUNO AI V35 — Render startup logger fix
+
+Moved logging.basicConfig() and log = logging.getLogger(...) above persistent_session_secret(), so the startup warning can be logged safely.
+
+Also set JUNO_SESSION_SECRET in Render Environment using a strong, random, persistent value. Do not rotate it casually after encrypted provider keys have been saved.

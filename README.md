@@ -221,3 +221,8 @@ Note: Render's ephemeral filesystem can lose SQLite changes after restarts. For 
 - Admins can export all knowledge entries as a portable JSON backup from the Knowledge Base tab. Imports remain append-only.
 - The admin Knowledge Base panel shows the saved entry count and database size, plus a warning if a Render persistent disk mount is not detected.
 - For persistent knowledge on Render, keep the SQLite database at `/var/data/juno.db` on a persistent disk. A deploy on ephemeral storage may appear to reset because a new empty database is created.
+
+
+## V35 — Render startup logger fix
+
+The logger is now initialized before `persistent_session_secret()` runs, preventing a `NameError: name 'log' is not defined` during Render startup when `JUNO_SESSION_SECRET` is unset. Configure `JUNO_SESSION_SECRET` as a stable Render environment variable for production deployments. Keep it unchanged after cloud API keys have been saved, because it is also used for encryption/session continuity.
